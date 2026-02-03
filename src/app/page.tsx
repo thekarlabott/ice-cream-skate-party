@@ -5,6 +5,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 // ─── Types ───────────────────────────────────────────────────────────
 type Flavor = "blueberry" | "mango";
 type GameState = "start" | "playing" | "gameover";
+type PowerUpType = "magnet" | "freeze" | "star" | "cherry";
+type ThemeKey = "sunrise" | "daytime" | "sunset" | "aurora";
 
 interface Scoop {
   id: number;
@@ -15,6 +17,18 @@ interface Scoop {
   wobble: number;
   wobbleSpeed: number;
   rotation: number;
+  golden: boolean;
+}
+
+interface PowerUp {
+  id: number;
+  x: number;
+  y: number;
+  type: PowerUpType;
+  speed: number;
+  wobble: number;
+  wobbleSpeed: number;
+  pulse: number;
 }
 
 interface Particle {
@@ -37,19 +51,78 @@ interface TrailDot {
   life: number;
 }
 
+interface ActivePowerUp {
+  type: PowerUpType;
+  remaining: number;
+  duration: number;
+}
+
 // ─── Constants ───────────────────────────────────────────────────────
 const SKATER_WIDTH = 60;
 const SKATER_HEIGHT = 60;
 const SCOOP_SIZE = 40;
-const CATCH_RADIUS = 50;
+const CATCH_RADIUS = 55;
 const INITIAL_SPAWN_INTERVAL = 1200;
 const MIN_SPAWN_INTERVAL = 400;
 const INITIAL_SPEED = 2;
 const MAX_SPEED = 7;
-const LIVES = 5;
+const LIVES = 10;
+const POWERUP_SPAWN_INTERVAL = 9000; // ~9 seconds
+const GOLDEN_SPAWN_INTERVAL_MIN = 20000;
+const GOLDEN_SPAWN_INTERVAL_MAX = 30000;
+const MAGNET_RANGE = 180;
 
 const BLUEBERRY_COLORS = ["#8b6cc1", "#a78bfa", "#c4b5fd", "#7c3aed"];
 const MANGO_COLORS = ["#f59e0b", "#fbbf24", "#fcd34d", "#f97316"];
+
+const POWERUP_COLORS: Record<PowerUpType, { glow: string; fill: string; icon: string }> = {
+  magnet: { glow: "rgba(168, 85, 247, 0.6)", fill: "#a855f7", icon: "🧲" },
+  freeze: { glow: "rgba(56, 189, 248, 0.6)", fill: "#38bdf8", icon: "❄️" },
+  star: { glow: "rgba(250, 204, 21, 0.6)", fill: "#facc15", icon: "⭐" },
+  cherry: { glow: "rgba(239, 68, 68, 0.6)", fill: "#ef4444", icon: "🍒" },
+};
+
+interface ThemeColors {
+  bg: [string, string, string, string];
+  rink: [string, string, string];
+}
+
+const THEMES: Record<ThemeKey, ThemeColors> = {
+  sunrise: {
+    bg: ["#2d1028", "#5c2d50", "#c2546b", "#f4a261"],
+    rink: ["rgba(255, 200, 180, 0.05)", "rgba(255, 200, 180, 0.12)", "rgba(255, 200, 180, 0.08)"],
+  },
+  daytime: {
+    bg: ["#1a0a3e", "#2d1b69", "#4a2080", "#1a0a3e"],
+    rink: ["rgba(180, 210, 255, 0.05)", "rgba(180, 210, 255, 0.12)", "rgba(180, 210, 255, 0.08)"],
+  },
+  sunset: {
+    bg: ["#1a0520", "#6b2040", "#c44e20", "#4a1060"],
+    rink: ["rgba(255, 160, 100, 0.05)", "rgba(255, 160, 100, 0.12)", "rgba(255, 160, 100, 0.08)"],
+  },
+  aurora: {
+    bg: ["#050818", "#0a1628", "#081020", "#050818"],
+    rink: ["rgba(100, 255, 200, 0.04)", "rgba(100, 255, 200, 0.10)", "rgba(100, 200, 255, 0.06)"],
+  },
+};
+
+function getThemeKey(score: number): ThemeKey {
+  if (score <= 50) return "sunrise";
+  if (score <= 150) return "daytime";
+  if (score <= 300) return "sunset";
+  return "aurora";
+}
+
+function lerpColor(a: string, b: string, t: number): string {
+  const pa = parseInt(a.slice(1), 16);
+  const pb = parseInt(b.slice(1), 16);
+  const ra = (pa >> 16) & 0xff, ga = (pa >> 8) & 0xff, ba2 = pa & 0xff;
+  const rb = (pb >> 16) & 0xff, gb = (pb >> 8) & 0xff, bb = pb & 0xff;
+  const r = Math.round(ra + (rb - ra) * t);
+  const g = Math.round(ga + (gb - ga) * t);
+  const bl = Math.round(ba2 + (bb - ba2) * t);
+  return `#${((1 << 24) + (r << 16) + (g << 8) + bl).toString(16).slice(1)}`;
+}
 
 // ─── Component ───────────────────────────────────────────────────────
 export default function IceCreamSkateParty() {
@@ -62,6 +135,7 @@ export default function IceCreamSkateParty() {
   const [lives, setLives] = useState(LIVES);
   const [highScore, setHighScore] = useState(0);
   const [showComboPopup, setShowComboPopup] = useState(false);
+  const [activePowerUps, setActivePowerUps] = useState<ActivePowerUp[]>([]);
 
   const scoreRef = useRef(0);
   const comboRef = useRef(0);
@@ -69,22 +143,35 @@ export default function IceCreamSkateParty() {
   const livesRef = useRef(LIVES);
   const highScoreRef = useRef(0);
 
-  const skaterRef = useRef({ x: 0, y: 0, targetX: 0, width: SKATER_WIDTH });
+  const skaterRef = useRef({ x: 0, y: 0, targetX: 0, targetY: 0, width: SKATER_WIDTH });
   const scoopsRef = useRef<Scoop[]>([]);
+  const powerUpsRef = useRef<PowerUp[]>([]);
+  const activePowerUpsRef = useRef<ActivePowerUp[]>([]);
   const particlesRef = useRef<Particle[]>([]);
   const trailRef = useRef<TrailDot[]>([]);
   const nextIdRef = useRef(0);
   const lastSpawnRef = useRef(0);
+  const lastPowerUpSpawnRef = useRef(0);
+  const lastGoldenSpawnRef = useRef(0);
+  const nextGoldenIntervalRef = useRef(0);
   const elapsedRef = useRef(0);
   const animFrameRef = useRef(0);
   const keysRef = useRef<Set<string>>(new Set());
-  const touchRef = useRef<number | null>(null);
+  const touchRef = useRef<{ id: number; startX: number; startY: number; lastX: number; lastY: number } | null>(null);
+  const shakeRef = useRef({ x: 0, y: 0, intensity: 0 });
+  const themeTransitionRef = useRef({ current: "sunrise" as ThemeKey, target: "sunrise" as ThemeKey, t: 1 });
+  const auroraPhaseRef = useRef(0);
 
   // ─── Helpers ─────────────────────────────────────────────────────
   const getId = () => nextIdRef.current++;
 
-  const spawnParticles = (x: number, y: number, flavor: Flavor, type: "sparkle" | "splat") => {
-    const colors = flavor === "blueberry" ? BLUEBERRY_COLORS : MANGO_COLORS;
+  const hasPowerUp = (type: PowerUpType): boolean => {
+    return activePowerUpsRef.current.some(p => p.type === type);
+  };
+
+  const spawnParticles = (x: number, y: number, flavor: Flavor | "golden", type: "sparkle" | "splat") => {
+    const colors = flavor === "golden" ? ["#fcd34d", "#fbbf24", "#f59e0b", "#ffffff"] :
+      flavor === "blueberry" ? BLUEBERRY_COLORS : MANGO_COLORS;
     const count = type === "splat" ? 12 : 8;
     for (let i = 0; i < count; i++) {
       const angle = (Math.PI * 2 * i) / count + Math.random() * 0.5;
@@ -113,38 +200,41 @@ export default function IceCreamSkateParty() {
       vy: -2,
       life: 1,
       maxLife: 1,
-      color: points >= 20 ? "#fcd34d" : "#ffffff",
-      size: points >= 20 ? 24 : 18,
+      color: points >= 50 ? "#fcd34d" : "#ffffff",
+      size: points >= 50 ? 24 : 18,
       type: "score",
     });
   };
 
   const getDifficulty = () => {
-    const t = Math.min(elapsedRef.current / 120, 1); // max difficulty at 2 min
+    const t = Math.min(elapsedRef.current / 120, 1);
     return {
       spawnInterval: INITIAL_SPAWN_INTERVAL - t * (INITIAL_SPAWN_INTERVAL - MIN_SPAWN_INTERVAL),
       speed: INITIAL_SPEED + t * (MAX_SPEED - INITIAL_SPEED),
     };
   };
 
+  const triggerShake = (intensity: number) => {
+    shakeRef.current.intensity = intensity;
+  };
+
   // ─── Game Loop ───────────────────────────────────────────────────
   const gameLoop = useCallback((canvas: HTMLCanvasElement, ctx: CanvasRenderingContext2D) => {
-    const W = canvas.width;
-    const H = canvas.height;
-    let lastTime = performance.now();
-
     const loop = (now: number) => {
       if (gameStateRef.current !== "playing") return;
 
-      const dt = Math.min((now - lastTime) / 1000, 0.05);
-      lastTime = now;
+      const W = canvas.width;
+      const H = canvas.height;
+
+      // Use a fixed-ish dt approach
+      const dt = 1 / 60;
       elapsedRef.current += dt;
 
       const { spawnInterval, speed } = getDifficulty();
 
       // ── Input ──
       const skater = skaterRef.current;
-      const moveSpeed = 500 * dt;
+      const moveSpeed = 800 * dt; // FAST movement
 
       if (keysRef.current.has("ArrowLeft") || keysRef.current.has("a")) {
         skater.targetX -= moveSpeed;
@@ -152,19 +242,38 @@ export default function IceCreamSkateParty() {
       if (keysRef.current.has("ArrowRight") || keysRef.current.has("d")) {
         skater.targetX += moveSpeed;
       }
+      if (keysRef.current.has("ArrowUp") || keysRef.current.has("w")) {
+        skater.targetY -= moveSpeed;
+      }
+      if (keysRef.current.has("ArrowDown") || keysRef.current.has("s")) {
+        skater.targetY += moveSpeed;
+      }
 
+      // Clamp to rink bounds
       skater.targetX = Math.max(SKATER_WIDTH / 2, Math.min(W - SKATER_WIDTH / 2, skater.targetX));
-      skater.x += (skater.targetX - skater.x) * 0.15;
-      skater.y = H - 80;
+      skater.targetY = Math.max(SKATER_HEIGHT / 2 + 40, Math.min(H - SKATER_HEIGHT / 2 - 10, skater.targetY));
+
+      // Snappy interpolation
+      skater.x += (skater.targetX - skater.x) * 0.3;
+      skater.y += (skater.targetY - skater.y) * 0.3;
 
       // ── Trail ──
-      if (Math.abs(skater.targetX - skater.x) > 2) {
+      const dx2 = skater.targetX - skater.x;
+      const dy2 = skater.targetY - skater.y;
+      if (Math.sqrt(dx2 * dx2 + dy2 * dy2) > 2) {
         trailRef.current.push({ id: getId(), x: skater.x, y: skater.y + 20, life: 1 });
       }
       trailRef.current = trailRef.current.filter(t => {
         t.life -= dt * 3;
         return t.life > 0;
       });
+
+      // ── Update active power-ups ──
+      activePowerUpsRef.current = activePowerUpsRef.current.filter(p => {
+        p.remaining -= dt;
+        return p.remaining > 0;
+      });
+      setActivePowerUps([...activePowerUpsRef.current]);
 
       // ── Spawn scoops ──
       if (now - lastSpawnRef.current > spawnInterval) {
@@ -179,17 +288,68 @@ export default function IceCreamSkateParty() {
           wobble: 0,
           wobbleSpeed: 2 + Math.random() * 3,
           rotation: Math.random() * Math.PI * 2,
+          golden: false,
         });
       }
+
+      // ── Spawn golden scoops ──
+      if (now - lastGoldenSpawnRef.current > nextGoldenIntervalRef.current) {
+        lastGoldenSpawnRef.current = now;
+        nextGoldenIntervalRef.current = GOLDEN_SPAWN_INTERVAL_MIN + Math.random() * (GOLDEN_SPAWN_INTERVAL_MAX - GOLDEN_SPAWN_INTERVAL_MIN);
+        scoopsRef.current.push({
+          id: getId(),
+          x: SCOOP_SIZE + Math.random() * (W - SCOOP_SIZE * 2),
+          y: -SCOOP_SIZE,
+          flavor: "mango",
+          speed: speed * 1.4,
+          wobble: 0,
+          wobbleSpeed: 3 + Math.random() * 2,
+          rotation: Math.random() * Math.PI * 2,
+          golden: true,
+        });
+      }
+
+      // ── Spawn power-ups ──
+      if (now - lastPowerUpSpawnRef.current > POWERUP_SPAWN_INTERVAL) {
+        lastPowerUpSpawnRef.current = now;
+        const types: PowerUpType[] = ["magnet", "freeze", "star", "cherry"];
+        const type = types[Math.floor(Math.random() * types.length)];
+        powerUpsRef.current.push({
+          id: getId(),
+          x: SCOOP_SIZE + Math.random() * (W - SCOOP_SIZE * 2),
+          y: -SCOOP_SIZE,
+          type,
+          speed: speed * 0.7,
+          wobble: 0,
+          wobbleSpeed: 2 + Math.random() * 2,
+          pulse: 0,
+        });
+      }
+
+      // ── Freeze effect on scoop speed ──
+      const freezeActive = hasPowerUp("freeze");
+      const speedMultiplier = freezeActive ? 0.5 : 1;
 
       // ── Update scoops ──
       const caughtScoops: Scoop[] = [];
       const missedScoops: Scoop[] = [];
 
       scoopsRef.current = scoopsRef.current.filter(scoop => {
-        scoop.y += scoop.speed * 60 * dt;
+        scoop.y += scoop.speed * 60 * dt * speedMultiplier;
         scoop.wobble += scoop.wobbleSpeed * dt;
         scoop.rotation += dt * 2;
+
+        // Magnet pull
+        if (hasPowerUp("magnet")) {
+          const mdx = skater.x - (scoop.x + Math.sin(scoop.wobble) * 15);
+          const mdy = skater.y - scoop.y;
+          const mdist = Math.sqrt(mdx * mdx + mdy * mdy);
+          if (mdist < MAGNET_RANGE && mdist > 0) {
+            const pull = (1 - mdist / MAGNET_RANGE) * 300 * dt;
+            scoop.x += (mdx / mdist) * pull;
+            scoop.y += (mdy / mdist) * pull;
+          }
+        }
 
         const dx = scoop.x + Math.sin(scoop.wobble) * 15 - skater.x;
         const dy = scoop.y - skater.y;
@@ -208,19 +368,72 @@ export default function IceCreamSkateParty() {
         return true;
       });
 
+      // ── Update power-ups ──
+      const caughtPowerUps: PowerUp[] = [];
+      powerUpsRef.current = powerUpsRef.current.filter(pu => {
+        pu.y += pu.speed * 60 * dt * speedMultiplier;
+        pu.wobble += pu.wobbleSpeed * dt;
+        pu.pulse += dt * 4;
+
+        const dx = pu.x + Math.sin(pu.wobble) * 10 - skater.x;
+        const dy = pu.y - skater.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+
+        if (dist < CATCH_RADIUS + 10) {
+          caughtPowerUps.push(pu);
+          return false;
+        }
+
+        if (pu.y > H + SCOOP_SIZE) {
+          return false; // power-ups don't cost lives
+        }
+
+        return true;
+      });
+
+      // ── Handle power-up catches ──
+      for (const pu of caughtPowerUps) {
+        if (pu.type === "cherry") {
+          livesRef.current = Math.min(livesRef.current + 1, LIVES);
+          setLives(livesRef.current);
+        } else {
+          const durations: Record<PowerUpType, number> = { magnet: 5, freeze: 3, star: 5, cherry: 0 };
+          // Remove existing of same type, add fresh
+          activePowerUpsRef.current = activePowerUpsRef.current.filter(p => p.type !== pu.type);
+          activePowerUpsRef.current.push({ type: pu.type, remaining: durations[pu.type], duration: durations[pu.type] });
+        }
+        // Particles for power-up catch
+        const colors = [POWERUP_COLORS[pu.type].fill, "#ffffff", POWERUP_COLORS[pu.type].fill];
+        for (let i = 0; i < 10; i++) {
+          const angle = (Math.PI * 2 * i) / 10;
+          const spd = 2 + Math.random() * 3;
+          particlesRef.current.push({
+            id: getId(), x: pu.x, y: pu.y,
+            vx: Math.cos(angle) * spd, vy: Math.sin(angle) * spd - 1,
+            life: 1, maxLife: 0.6,
+            color: colors[Math.floor(Math.random() * colors.length)],
+            size: 3 + Math.random() * 3, type: "sparkle",
+          });
+        }
+        spawnScoreParticle(pu.x, pu.y - 20, 0);
+      }
+
       // ── Handle catches ──
       for (const scoop of caughtScoops) {
         comboRef.current++;
         const multiplier = Math.min(Math.floor(comboRef.current / 5) + 1, 5);
-        const points = 10 * multiplier;
+        const starMultiplier = hasPowerUp("star") ? 2 : 1;
+        const goldenMultiplier = scoop.golden ? 10 : 1;
+        const points = 10 * multiplier * starMultiplier * goldenMultiplier;
         scoreRef.current += points;
         if (comboRef.current > bestComboRef.current) bestComboRef.current = comboRef.current;
 
-        spawnParticles(scoop.x, scoop.y, scoop.flavor, "sparkle");
+        spawnParticles(scoop.x, scoop.y, scoop.golden ? "golden" : scoop.flavor, "sparkle");
         spawnScoreParticle(scoop.x, scoop.y - 20, points);
 
         if (comboRef.current > 0 && comboRef.current % 5 === 0) {
           setShowComboPopup(true);
+          triggerShake(4);
           setTimeout(() => setShowComboPopup(false), 800);
         }
 
@@ -249,7 +462,10 @@ export default function IceCreamSkateParty() {
         }
       }
 
-      // ── Update particles ──
+      // ── Update particles (cap count for perf) ──
+      if (particlesRef.current.length > 200) {
+        particlesRef.current = particlesRef.current.slice(-150);
+      }
       particlesRef.current = particlesRef.current.filter(p => {
         p.x += p.vx;
         p.y += p.vy;
@@ -259,15 +475,63 @@ export default function IceCreamSkateParty() {
         return p.life > 0;
       });
 
+      // ── Screen shake decay ──
+      const shake = shakeRef.current;
+      if (shake.intensity > 0.1) {
+        shake.x = (Math.random() - 0.5) * shake.intensity;
+        shake.y = (Math.random() - 0.5) * shake.intensity;
+        shake.intensity *= 0.9;
+      } else {
+        shake.x = 0;
+        shake.y = 0;
+        shake.intensity = 0;
+      }
+
+      // ── Theme transitions ──
+      const targetTheme = getThemeKey(scoreRef.current);
+      const tt = themeTransitionRef.current;
+      if (tt.target !== targetTheme) {
+        tt.current = tt.target;
+        tt.target = targetTheme;
+        tt.t = 0;
+      }
+      if (tt.t < 1) {
+        tt.t = Math.min(tt.t + dt * 0.3, 1); // smooth ~3s transition
+      }
+
+      const fromTheme = THEMES[tt.current];
+      const toTheme = THEMES[tt.target];
+      const tBlend = tt.t;
+
       // ── Draw ──
-      // Background gradient
+      ctx.save();
+      ctx.translate(shake.x, shake.y);
+
+      // Background gradient with theme blend
       const bgGrad = ctx.createLinearGradient(0, 0, W, H);
-      bgGrad.addColorStop(0, "#1a0a3e");
-      bgGrad.addColorStop(0.4, "#2d1b69");
-      bgGrad.addColorStop(0.7, "#4a2080");
-      bgGrad.addColorStop(1, "#1a0a3e");
+      bgGrad.addColorStop(0, lerpColor(fromTheme.bg[0], toTheme.bg[0], tBlend));
+      bgGrad.addColorStop(0.4, lerpColor(fromTheme.bg[1], toTheme.bg[1], tBlend));
+      bgGrad.addColorStop(0.7, lerpColor(fromTheme.bg[2], toTheme.bg[2], tBlend));
+      bgGrad.addColorStop(1, lerpColor(fromTheme.bg[3], toTheme.bg[3], tBlend));
       ctx.fillStyle = bgGrad;
-      ctx.fillRect(0, 0, W, H);
+      ctx.fillRect(-10, -10, W + 20, H + 20);
+
+      // Aurora effect for aurora theme
+      if (tt.target === "aurora" || tt.current === "aurora") {
+        const auroraAlpha = tt.target === "aurora" ? tBlend * 0.3 : (1 - tBlend) * 0.3;
+        auroraPhaseRef.current += dt * 0.5;
+        const phase = auroraPhaseRef.current;
+        for (let i = 0; i < 5; i++) {
+          const xOff = Math.sin(phase + i * 1.2) * W * 0.3;
+          const yOff = H * 0.1 + Math.cos(phase * 0.7 + i) * H * 0.1;
+          const grad = ctx.createRadialGradient(W / 2 + xOff, yOff, 0, W / 2 + xOff, yOff, W * 0.4);
+          const hue = i % 2 === 0 ? "rgba(100, 255, 180," : "rgba(150, 100, 255,";
+          grad.addColorStop(0, `${hue} ${auroraAlpha})`);
+          grad.addColorStop(1, `${hue} 0)`);
+          ctx.fillStyle = grad;
+          ctx.fillRect(0, 0, W, H);
+        }
+      }
 
       // Rink surface
       const rinkGrad = ctx.createLinearGradient(0, H * 0.6, 0, H);
@@ -315,36 +579,65 @@ export default function IceCreamSkateParty() {
         ctx.translate(sx, sy);
         ctx.rotate(scoop.rotation);
 
-        // Glow
-        const glowColor = scoop.flavor === "blueberry" ? "rgba(167, 139, 250, 0.4)" : "rgba(251, 191, 36, 0.4)";
-        ctx.shadowColor = glowColor;
-        ctx.shadowBlur = 15;
+        if (scoop.golden) {
+          // Golden glow
+          ctx.shadowColor = "rgba(255, 215, 0, 0.8)";
+          ctx.shadowBlur = 25 + Math.sin(elapsedRef.current * 6) * 8;
 
-        // Scoop body
-        const scoopGrad = ctx.createRadialGradient(0, 0, 2, 0, 0, SCOOP_SIZE / 2);
-        if (scoop.flavor === "blueberry") {
-          scoopGrad.addColorStop(0, "#c4b5fd");
-          scoopGrad.addColorStop(0.5, "#8b6cc1");
-          scoopGrad.addColorStop(1, "#5b3a9e");
+          const goldGrad = ctx.createRadialGradient(0, 0, 2, 0, 0, SCOOP_SIZE / 2);
+          goldGrad.addColorStop(0, "#fff8dc");
+          goldGrad.addColorStop(0.4, "#ffd700");
+          goldGrad.addColorStop(0.8, "#daa520");
+          goldGrad.addColorStop(1, "#b8860b");
+          ctx.fillStyle = goldGrad;
+          ctx.beginPath();
+          ctx.arc(0, 0, SCOOP_SIZE / 2, 0, Math.PI * 2);
+          ctx.fill();
+
+          // Star sparkle overlay
+          ctx.fillStyle = `rgba(255, 255, 255, ${0.3 + Math.sin(elapsedRef.current * 8) * 0.2})`;
+          ctx.beginPath();
+          for (let i = 0; i < 5; i++) {
+            const a = (Math.PI * 2 * i) / 5 - Math.PI / 2 + elapsedRef.current * 3;
+            const r1 = SCOOP_SIZE / 2.5;
+            const r2 = SCOOP_SIZE / 6;
+            ctx.lineTo(Math.cos(a) * r1, Math.sin(a) * r1);
+            const a2 = a + Math.PI / 5;
+            ctx.lineTo(Math.cos(a2) * r2, Math.sin(a2) * r2);
+          }
+          ctx.closePath();
+          ctx.fill();
         } else {
-          scoopGrad.addColorStop(0, "#fcd34d");
-          scoopGrad.addColorStop(0.5, "#f59e0b");
-          scoopGrad.addColorStop(1, "#d97706");
-        }
-        ctx.fillStyle = scoopGrad;
-        ctx.beginPath();
-        ctx.arc(0, 0, SCOOP_SIZE / 2, 0, Math.PI * 2);
-        ctx.fill();
+          // Normal scoop
+          const glowColor = scoop.flavor === "blueberry" ? "rgba(167, 139, 250, 0.4)" : "rgba(251, 191, 36, 0.4)";
+          ctx.shadowColor = glowColor;
+          ctx.shadowBlur = 15;
 
-        // Highlight
-        ctx.fillStyle = "rgba(255, 255, 255, 0.3)";
-        ctx.beginPath();
-        ctx.arc(-5, -5, SCOOP_SIZE / 5, 0, Math.PI * 2);
-        ctx.fill();
+          const scoopGrad = ctx.createRadialGradient(0, 0, 2, 0, 0, SCOOP_SIZE / 2);
+          if (scoop.flavor === "blueberry") {
+            scoopGrad.addColorStop(0, "#c4b5fd");
+            scoopGrad.addColorStop(0.5, "#8b6cc1");
+            scoopGrad.addColorStop(1, "#5b3a9e");
+          } else {
+            scoopGrad.addColorStop(0, "#fcd34d");
+            scoopGrad.addColorStop(0.5, "#f59e0b");
+            scoopGrad.addColorStop(1, "#d97706");
+          }
+          ctx.fillStyle = scoopGrad;
+          ctx.beginPath();
+          ctx.arc(0, 0, SCOOP_SIZE / 2, 0, Math.PI * 2);
+          ctx.fill();
+
+          // Highlight
+          ctx.fillStyle = "rgba(255, 255, 255, 0.3)";
+          ctx.beginPath();
+          ctx.arc(-5, -5, SCOOP_SIZE / 5, 0, Math.PI * 2);
+          ctx.fill();
+        }
 
         // Cone base
         ctx.shadowBlur = 0;
-        ctx.fillStyle = "#d4a057";
+        ctx.fillStyle = scoop.golden ? "#c8a020" : "#d4a057";
         ctx.beginPath();
         ctx.moveTo(-10, SCOOP_SIZE / 2 - 5);
         ctx.lineTo(10, SCOOP_SIZE / 2 - 5);
@@ -353,7 +646,7 @@ export default function IceCreamSkateParty() {
         ctx.fill();
 
         // Waffle pattern
-        ctx.strokeStyle = "#c28a3e";
+        ctx.strokeStyle = scoop.golden ? "#a08010" : "#c28a3e";
         ctx.lineWidth = 0.5;
         ctx.beginPath();
         ctx.moveTo(-6, SCOOP_SIZE / 2 - 2);
@@ -364,9 +657,11 @@ export default function IceCreamSkateParty() {
 
         ctx.restore();
 
-        // Sparkle trail
-        if (Math.random() > 0.6) {
-          const colors = scoop.flavor === "blueberry" ? BLUEBERRY_COLORS : MANGO_COLORS;
+        // Sparkle trail (golden gets more)
+        const trailChance = scoop.golden ? 0.3 : 0.6;
+        if (Math.random() > trailChance) {
+          const colors = scoop.golden ? ["#ffd700", "#ffffff", "#fcd34d"] :
+            scoop.flavor === "blueberry" ? BLUEBERRY_COLORS : MANGO_COLORS;
           particlesRef.current.push({
             id: getId(),
             x: sx + (Math.random() - 0.5) * 20,
@@ -374,12 +669,76 @@ export default function IceCreamSkateParty() {
             vx: (Math.random() - 0.5) * 0.5,
             vy: -0.5 - Math.random(),
             life: 1,
-            maxLife: 0.4,
+            maxLife: scoop.golden ? 0.6 : 0.4,
             color: colors[Math.floor(Math.random() * colors.length)],
             size: 1.5 + Math.random() * 2,
             type: "trail",
           });
         }
+      }
+
+      // ── Draw power-ups ──
+      for (const pu of powerUpsRef.current) {
+        const px = pu.x + Math.sin(pu.wobble) * 10;
+        const py = pu.y;
+        const pInfo = POWERUP_COLORS[pu.type];
+        const pulseSize = 1 + Math.sin(pu.pulse) * 0.15;
+
+        ctx.save();
+        ctx.translate(px, py);
+        ctx.scale(pulseSize, pulseSize);
+
+        // Outer glow ring
+        ctx.shadowColor = pInfo.glow;
+        ctx.shadowBlur = 20 + Math.sin(pu.pulse) * 8;
+
+        // Hexagonal shape
+        ctx.fillStyle = pInfo.fill;
+        ctx.globalAlpha = 0.9;
+        ctx.beginPath();
+        for (let i = 0; i < 6; i++) {
+          const angle = (Math.PI / 3) * i - Math.PI / 6;
+          const r = SCOOP_SIZE / 2 + 2;
+          if (i === 0) ctx.moveTo(Math.cos(angle) * r, Math.sin(angle) * r);
+          else ctx.lineTo(Math.cos(angle) * r, Math.sin(angle) * r);
+        }
+        ctx.closePath();
+        ctx.fill();
+
+        // Inner lighter fill
+        ctx.fillStyle = "rgba(255,255,255,0.2)";
+        ctx.beginPath();
+        for (let i = 0; i < 6; i++) {
+          const angle = (Math.PI / 3) * i - Math.PI / 6;
+          const r = SCOOP_SIZE / 3;
+          if (i === 0) ctx.moveTo(Math.cos(angle) * r, Math.sin(angle) * r);
+          else ctx.lineTo(Math.cos(angle) * r, Math.sin(angle) * r);
+        }
+        ctx.closePath();
+        ctx.fill();
+
+        // Glowing border
+        ctx.strokeStyle = "rgba(255,255,255,0.6)";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        for (let i = 0; i < 6; i++) {
+          const angle = (Math.PI / 3) * i - Math.PI / 6;
+          const r = SCOOP_SIZE / 2 + 2;
+          if (i === 0) ctx.moveTo(Math.cos(angle) * r, Math.sin(angle) * r);
+          else ctx.lineTo(Math.cos(angle) * r, Math.sin(angle) * r);
+        }
+        ctx.closePath();
+        ctx.stroke();
+
+        // Icon
+        ctx.globalAlpha = 1;
+        ctx.shadowBlur = 0;
+        ctx.font = "20px sans-serif";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(pInfo.icon, 0, 1);
+
+        ctx.restore();
       }
 
       // ── Draw particles ──
@@ -391,15 +750,14 @@ export default function IceCreamSkateParty() {
           ctx.textAlign = "center";
           ctx.shadowColor = p.color;
           ctx.shadowBlur = 10;
-          const points = p.size >= 24 ? "✨" : "+";
-          ctx.fillText(`${points}${Math.round(p.size >= 24 ? scoreRef.current : 10)}`, p.x, p.y);
+          const txt = p.size >= 24 ? `✨+${Math.round(p.size >= 24 ? 100 : 10)}` : `+10`;
+          ctx.fillText(txt, p.x, p.y);
           ctx.shadowBlur = 0;
         } else {
           ctx.fillStyle = p.color;
           ctx.shadowColor = p.color;
           ctx.shadowBlur = p.type === "sparkle" ? 8 : 4;
           if (p.type === "sparkle" || p.type === "trail") {
-            // Star shape for sparkles
             ctx.beginPath();
             const s = p.size * p.life;
             for (let i = 0; i < 4; i++) {
@@ -430,12 +788,33 @@ export default function IceCreamSkateParty() {
       ctx.ellipse(sk.x, sk.y + 28, 25, 8, 0, 0, Math.PI * 2);
       ctx.fill();
 
-      // Skater body
       ctx.save();
       ctx.translate(sk.x, sk.y);
 
+      // Star power-up golden glow
+      if (hasPowerUp("star")) {
+        ctx.shadowColor = "rgba(255, 215, 0, 0.7)";
+        ctx.shadowBlur = 30 + Math.sin(elapsedRef.current * 5) * 10;
+        ctx.fillStyle = "rgba(255, 215, 0, 0.08)";
+        ctx.beginPath();
+        ctx.arc(0, 0, 45, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // Magnet power-up purple aura
+      if (hasPowerUp("magnet")) {
+        ctx.strokeStyle = `rgba(168, 85, 247, ${0.2 + Math.sin(elapsedRef.current * 4) * 0.1})`;
+        ctx.lineWidth = 2;
+        const magR = MAGNET_RANGE * (0.3 + Math.sin(elapsedRef.current * 3) * 0.05);
+        ctx.setLineDash([8, 8]);
+        ctx.beginPath();
+        ctx.arc(0, 0, magR, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
       // Body glow
-      ctx.shadowColor = "rgba(167, 139, 250, 0.5)";
+      ctx.shadowColor = hasPowerUp("star") ? "rgba(255, 215, 0, 0.7)" : "rgba(167, 139, 250, 0.5)";
       ctx.shadowBlur = 20;
 
       // Skate blades
@@ -462,15 +841,20 @@ export default function IceCreamSkateParty() {
 
       // Body / Torso
       const bodyGrad = ctx.createLinearGradient(0, -15, 0, 8);
-      bodyGrad.addColorStop(0, "#f59e0b");
-      bodyGrad.addColorStop(1, "#d97706");
+      if (hasPowerUp("star")) {
+        bodyGrad.addColorStop(0, "#ffd700");
+        bodyGrad.addColorStop(1, "#daa520");
+      } else {
+        bodyGrad.addColorStop(0, "#f59e0b");
+        bodyGrad.addColorStop(1, "#d97706");
+      }
       ctx.fillStyle = bodyGrad;
       ctx.beginPath();
       ctx.roundRect(-14, -12, 28, 20, 8);
       ctx.fill();
 
       // Stripe on shirt
-      ctx.fillStyle = "#fbbf24";
+      ctx.fillStyle = hasPowerUp("star") ? "#ffe66d" : "#fbbf24";
       ctx.fillRect(-12, -4, 24, 4);
 
       // Arms
@@ -478,7 +862,7 @@ export default function IceCreamSkateParty() {
       ctx.save();
       ctx.translate(-14, -6);
       ctx.rotate(-0.5 + armWave);
-      ctx.fillStyle = "#f59e0b";
+      ctx.fillStyle = hasPowerUp("star") ? "#ffd700" : "#f59e0b";
       ctx.fillRect(-2, 0, 5, 14);
       ctx.fillStyle = "#fcd9a0";
       ctx.beginPath();
@@ -489,7 +873,7 @@ export default function IceCreamSkateParty() {
       ctx.save();
       ctx.translate(14, -6);
       ctx.rotate(0.5 - armWave);
-      ctx.fillStyle = "#f59e0b";
+      ctx.fillStyle = hasPowerUp("star") ? "#ffd700" : "#f59e0b";
       ctx.fillRect(-3, 0, 5, 14);
       ctx.fillStyle = "#fcd9a0";
       ctx.beginPath();
@@ -556,8 +940,16 @@ export default function IceCreamSkateParty() {
       ctx.font = "20px Fredoka, sans-serif";
       ctx.textAlign = "left";
       ctx.fillStyle = "#ffffff";
-      const heartsStr = "❤️".repeat(livesRef.current) + "🖤".repeat(LIVES - livesRef.current);
+      const heartsStr = "❤️".repeat(livesRef.current) + "🖤".repeat(Math.max(0, LIVES - livesRef.current));
       ctx.fillText(heartsStr, 16, 80);
+
+      // ── Freeze overlay ──
+      if (freezeActive) {
+        ctx.fillStyle = "rgba(56, 189, 248, 0.05)";
+        ctx.fillRect(0, 0, W, H);
+      }
+
+      ctx.restore(); // end shake transform
 
       animFrameRef.current = requestAnimationFrame(loop);
     };
@@ -579,14 +971,22 @@ export default function IceCreamSkateParty() {
     livesRef.current = LIVES;
     elapsedRef.current = 0;
     lastSpawnRef.current = performance.now();
+    lastPowerUpSpawnRef.current = performance.now();
+    lastGoldenSpawnRef.current = performance.now();
+    nextGoldenIntervalRef.current = GOLDEN_SPAWN_INTERVAL_MIN + Math.random() * (GOLDEN_SPAWN_INTERVAL_MAX - GOLDEN_SPAWN_INTERVAL_MIN);
     scoopsRef.current = [];
+    powerUpsRef.current = [];
+    activePowerUpsRef.current = [];
     particlesRef.current = [];
     trailRef.current = [];
+    shakeRef.current = { x: 0, y: 0, intensity: 0 };
+    themeTransitionRef.current = { current: "sunrise", target: "sunrise", t: 1 };
 
     skaterRef.current = {
       x: canvas.width / 2,
       y: canvas.height - 80,
       targetX: canvas.width / 2,
+      targetY: canvas.height - 80,
       width: SKATER_WIDTH,
     };
 
@@ -594,6 +994,7 @@ export default function IceCreamSkateParty() {
     setCombo(0);
     setBestCombo(0);
     setLives(LIVES);
+    setActivePowerUps([]);
 
     try {
       const saved = localStorage.getItem("icsp-highscore");
@@ -619,6 +1020,8 @@ export default function IceCreamSkateParty() {
       if (gameStateRef.current !== "playing") {
         skaterRef.current.x = canvas.width / 2;
         skaterRef.current.targetX = canvas.width / 2;
+        skaterRef.current.y = canvas.height - 80;
+        skaterRef.current.targetY = canvas.height - 80;
       }
     };
 
@@ -645,7 +1048,7 @@ export default function IceCreamSkateParty() {
     };
   }, [startGame]);
 
-  // ─── Touch input ───────────────────────────────────────────────────
+  // ─── Touch input (iPad optimized, full-screen, multi-touch) ────────
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -656,31 +1059,80 @@ export default function IceCreamSkateParty() {
         startGame();
         return;
       }
-      const touch = e.touches[0];
-      touchRef.current = touch.clientX;
+      const touch = e.changedTouches[0];
+      touchRef.current = {
+        id: touch.identifier,
+        startX: touch.clientX,
+        startY: touch.clientY,
+        lastX: touch.clientX,
+        lastY: touch.clientY,
+      };
+      // Move directly to touch position for immediate response
       skaterRef.current.targetX = touch.clientX;
+      skaterRef.current.targetY = touch.clientY;
     };
 
     const onTouchMove = (e: TouchEvent) => {
       e.preventDefault();
       if (gameStateRef.current !== "playing") return;
-      const touch = e.touches[0];
+
+      // Find our tracked touch or use first available
+      let touch: Touch | null = null;
+      for (let i = 0; i < e.touches.length; i++) {
+        if (touchRef.current && e.touches[i].identifier === touchRef.current.id) {
+          touch = e.touches[i];
+          break;
+        }
+      }
+      if (!touch) touch = e.touches[0];
+      if (!touch) return;
+
+      // 1:1 direct position mapping for responsive feel
       skaterRef.current.targetX = touch.clientX;
+      skaterRef.current.targetY = touch.clientY;
+
+      if (touchRef.current) {
+        touchRef.current.lastX = touch.clientX;
+        touchRef.current.lastY = touch.clientY;
+      }
     };
 
     const onTouchEnd = (e: TouchEvent) => {
       e.preventDefault();
-      touchRef.current = null;
+      if (e.touches.length === 0) {
+        touchRef.current = null;
+      } else {
+        // Switch to remaining touch
+        const remaining = e.touches[0];
+        touchRef.current = {
+          id: remaining.identifier,
+          startX: remaining.clientX,
+          startY: remaining.clientY,
+          lastX: remaining.clientX,
+          lastY: remaining.clientY,
+        };
+      }
+    };
+
+    // Prevent rubber-banding globally
+    const preventScroll = (e: TouchEvent) => {
+      if (gameStateRef.current === "playing") {
+        e.preventDefault();
+      }
     };
 
     canvas.addEventListener("touchstart", onTouchStart, { passive: false });
     canvas.addEventListener("touchmove", onTouchMove, { passive: false });
     canvas.addEventListener("touchend", onTouchEnd, { passive: false });
+    canvas.addEventListener("touchcancel", onTouchEnd, { passive: false });
+    document.addEventListener("touchmove", preventScroll, { passive: false });
 
     return () => {
       canvas.removeEventListener("touchstart", onTouchStart);
       canvas.removeEventListener("touchmove", onTouchMove);
       canvas.removeEventListener("touchend", onTouchEnd);
+      canvas.removeEventListener("touchcancel", onTouchEnd);
+      document.removeEventListener("touchmove", preventScroll);
     };
   }, [startGame]);
 
@@ -701,11 +1153,12 @@ export default function IceCreamSkateParty() {
   }));
 
   return (
-    <div className="relative w-screen h-screen overflow-hidden bg-[#1a0a3e]">
+    <div className="relative w-screen h-screen overflow-hidden bg-[#1a0a3e]" style={{ touchAction: "none" }}>
       {/* Canvas */}
       <canvas
         ref={canvasRef}
         className="absolute inset-0 w-full h-full"
+        style={{ touchAction: "none" }}
         onClick={() => {
           if (gameStateRef.current !== "playing") startGame();
         }}
@@ -727,12 +1180,33 @@ export default function IceCreamSkateParty() {
         />
       ))}
 
-      {/* HUD - Score */}
+      {/* HUD - Score + Power-ups */}
       {gameState === "playing" && (
         <div className="absolute top-4 left-0 right-0 flex justify-between items-start px-4 pointer-events-none z-10">
-          <div className="glass-panel px-5 py-3" style={{ animation: "slide-in 0.3s ease-out" }}>
-            <div className="text-white/60 text-xs uppercase tracking-wider">Score</div>
-            <div className="text-white text-2xl font-bold">{score.toLocaleString()}</div>
+          <div>
+            <div className="glass-panel px-5 py-3" style={{ animation: "slide-in 0.3s ease-out" }}>
+              <div className="text-white/60 text-xs uppercase tracking-wider">Score</div>
+              <div className="text-white text-2xl font-bold">{score.toLocaleString()}</div>
+            </div>
+
+            {/* Active power-up indicators */}
+            {activePowerUps.length > 0 && (
+              <div className="flex gap-2 mt-2">
+                {activePowerUps.map((ap, i) => (
+                  <div
+                    key={`${ap.type}-${i}`}
+                    className="glass-panel px-3 py-2 text-center"
+                    style={{
+                      borderColor: POWERUP_COLORS[ap.type].glow,
+                      background: `${POWERUP_COLORS[ap.type].glow.replace("0.6", "0.15")}`,
+                    }}
+                  >
+                    <div className="text-sm">{POWERUP_COLORS[ap.type].icon}</div>
+                    <div className="text-white text-xs font-bold">{Math.ceil(ap.remaining)}s</div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
 
           {combo >= 3 && (
@@ -787,7 +1261,7 @@ export default function IceCreamSkateParty() {
             </div>
 
             <p className="text-white/70 text-sm md:text-base mb-6 leading-relaxed">
-              Skate across the rink and catch falling ice cream scoops!
+              Skate around the rink and catch falling ice cream scoops!
               <br />
               <span className="text-[#c4b5fd]">🫐 Blueberry</span> &{" "}
               <span className="text-[#fbbf24]">🥭 Mango</span> flavors!
@@ -795,13 +1269,16 @@ export default function IceCreamSkateParty() {
 
             <div className="space-y-3 mb-8">
               <div className="flex items-center justify-center gap-2 text-white/50 text-sm">
-                <span>🎮</span> Arrow keys / A,D to move
+                <span>🎮</span> Arrow keys / WASD to skate freely
               </div>
               <div className="flex items-center justify-center gap-2 text-white/50 text-sm">
-                <span>📱</span> Touch & drag to skate
+                <span>📱</span> Touch & drag anywhere to skate
               </div>
               <div className="flex items-center justify-center gap-2 text-white/50 text-sm">
                 <span>🔥</span> Build combos for multipliers!
+              </div>
+              <div className="flex items-center justify-center gap-2 text-white/50 text-sm">
+                <span>✨</span> Catch power-ups & golden scoops!
               </div>
             </div>
 
